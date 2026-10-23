@@ -1,0 +1,399 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS CDS Agentic AI Partner Hackathon demo -- "Rex" thin-wrapper agent
+  orchestrator with SMS/email inbound, DynamoDB sessions, and outbound replies.
+
+# NOTE (issue 105): AWS::SES::ReceiptRuleSet resources are created INACTIVE by
+# default, and CloudFormation cannot activate a receipt rule set. Activation
+# requires a manual, out-of-repo call to the SES `SetActiveReceiptRuleSet` API
+# on the rule set created below. This repository performs no deployment,
+# shell, or activation actions; activation is an entrant manual step
+# documented in README.md ("Prerequisites and Setup Checklist", step 3).
+
+Parameters:
+  JudgingEmail:
+    Type: String
+    Default: judges@cds.3dogs.ai
+    Description: >
+      The email address judges use to send questions. This must exactly match
+      the SES receipt rule's Recipients list (verified by test_receipt_rule.py).
+    # NOTE (issue 95): constrain the parameter so the receipt rule can only
+    # ever match a single verified address on the cds.3dogs.ai domain, never
+    # any other mailbox, an apex-domain mailbox, or an arbitrary recipient.
+    AllowedPattern: "^[A-Za-z0-9._%+-]+@cds\\.3dogs\\.ai$"
+    ConstraintDescription: >
+      Must be a single mailbox on the cds.3dogs.ai domain
+      (e.g. judges@cds.3dogs.ai).
+
+  NexusEndpoint:
+    Type: String
+    NoEcho: true
+    Description: >
+      Base URL of the awscds-engine stack's Lambda Function URL
+      (stack output EngineUrl) in engine/. The orchestrator calls this
+      endpoint over HTTPS for agent reasoning.
+  NexusToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Bearer token for the awscds-engine Lambda (stack output EngineUrl).
+      Prefer leaving this empty and setting NEXUS_TOKEN from a secrets source
+      at runtime; this parameter exists only as a deploy-time fallback. Never
+      commit a real token to this repository.
+
+# NOTE (issue 95): defense-in-depth condition ensuring the receipt rule set is
+# only created when JudgingEmail is exactly the judges' address, so the rule
+# cannot silently match (or fail to match) an unintended recipient.
+Conditions:
+  IsJudgingEmail: !Equals [!Ref JudgingEmail, "judges@cds.3dogs.ai"]
+
+Resources:
+  # Inbound routing: SES receipt rule -> Lambda
+  # NOTE (issue 109): DependsOn ensures the Lambda permission (and thus the
+  # function's execution role, which SAM creates before the permission can
+  # reference the function) exists before the receipt rule is enabled,
+  # otherwise SES can silently drop or bounce mail delivered to the action.
+  # NOTE (issue 110): the Lambda action's InvocationType defaults to `Event`
+  # (asynchronous), which is intentional here: SES hands the message off and
+  # the function replies as the orchestrator, so there is no synchronous
+  # response to return. Because async invocation has no SES-side bounce path,
+  # failure visibility is provided instead by (a) the DLQ/EventInvokeConfig on
+  # OrchestratorFunction below, (b) the OrchestratorErrorsAlarm CloudWatch
+  # alarm on the function's Errors metric, and (c) the test
+  # test_receipt_rule.py, which parses this template and asserts the
+  # Recipients list is exactly ["judges@cds.3dogs.ai"] so a JudgingEmail
+  # parameter mismatch cannot silently drop mail undetected.
+  InboundEmailRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Condition: IsJudgingEmail
+    Properties:
+      # Fixed name: the deploy helper activates exactly this rule set.
+      RuleSetName: awscds-inbound
+  InboundEmailRule:
+    Type: AWS::SES::ReceiptRule
+    Condition: IsJudgingEmail
+    DependsOn:
+      - InboundEmailPermission
+      - InboundMailBucketPolicy
+    Properties:
+      RuleSetName: !Ref InboundEmailRuleSet
+      Rule:
+        Name: !Sub "InboundEmailRule-${AWS::StackName}"
+        Enabled: true
+        # NOTE (issue 95): require TLS for inbound mail instead of the
+        # default Optional, so unencrypted delivery is rejected.
+        TlsPolicy: Require
+        Recipients:
+          - judges@cds.3dogs.ai
+        Actions:
+          - S3Action:
+              BucketName: !Ref InboundMailBucket
+              ObjectKeyPrefix: inbound/
+          - LambdaAction:
+              FunctionArn: !GetAtt OrchestratorFunction.Arn
+              # NOTE (issue 110): explicit async invocation; failure
+              # handling is via the function's DLQ + Errors alarm, since
+              # an async Lambda action gives SES no synchronous bounce.
+              InvocationType: Event
+
+  # Inbound routing: SNS topic for SMS events -> Lambda.
+  # NOTE (issues 102, 103, 107): no inline `Subscription` block here, and no
+  # separate Lambda permission for SNS. The SAM `SNS` event on
+  # OrchestratorFunction below is the ONLY subscription wiring: it creates the
+  # Lambda subscription AND the sns.amazonaws.com invoke permission itself.
+  # Declaring a topic-level Subscription as well would wire the topic twice
+  # and double-invoke the function per inbound SMS (duplicate outbound
+  # replies, duplicate session writes); declaring only an inline Subscription
+  # without the SAM event would leave SNS with no invoke permission and fail
+  # with access denied.
+  #
+  # NOTE (issue 10): the SMS origination side (AWS End User Messaging SMS /
+  # pinpoint-sms-voice-v2 phone number or pool, plus a configuration set whose
+  # event destination publishes to this SNS topic) is OWNER-PROVISIONED,
+  # out-of-repo, because number registration (e.g. US 10DLC / toll-free
+  # verification) requires manual, account-specific approval flows. The
+  # entrant's manual step: in the End User Messaging SMS console, attach a
+  # configuration set event destination (two-way message events) to
+  # InboundSmsTopicArn (see Outputs). This template already wires the SNS
+  # subscription and invoke permission via the SAM SNS event below.
+  InboundSmsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "InboundSmsTopic-${AWS::StackName}"
+
+  # Dead-letter queue for failed asynchronous invocations (issue 104).
+  # Without a DLQ, retry-exhausted SES/SNS async invocations lose their event
+  # payloads silently, making debugging impossible. The DLQ below retains
+  # failed events for inspection; this repository performs no telemetry or
+  # automatic outbound reporting from it -- draining/replaying is a manual,
+  # entrant-run action.
+  OrchestratorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # NOTE (issue 110): CloudWatch alarm on the orchestrator's Errors metric so
+  # a failed async invocation (from either the SES receipt-rule action or the
+  # SNS event) is visible immediately instead of silently dropping inbound
+  # email/SMS. The alarm is intentionally notification-free in this repo --
+  # wiring an SNS notification target is a manual, entrant-run action; this
+  # repository performs no telemetry or automatic outbound reporting.
+  OrchestratorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-orchestrator-errors"
+      AlarmDescription: >
+        Orchestrator Lambda Errors > 0 in 5 minutes. Indicates failed async
+        invocations; failed events are also retained on OrchestratorDLQ.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrchestratorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # Session persistence and feedback state
+  # NOTE (issues 5, 113): TTL on `expires_at` bounds unbounded session
+  # growth. This TTL is RETAINED (the earlier TTL proposal is
+  # accepted; infinite retention is NOT acceptable for a long-running demo).
+  # src/sessions.py `save_session` writes `expires_at` (epoch seconds) on
+  # every session upsert, so each active session's expiry is rolling and
+  # idle sessions are deleted automatically by DynamoDB TTL.
+  # Single hash key `session_id` = "<channel>:<sender>" (e.g. email:a@b.org),
+  # which is exactly the key src/sessions.py reads and writes, so parallel
+  # per-channel sessions never collide. (A composite key with a `channel`
+  # range attribute would make every get_item/update_item fail validation.)
+  # One record per conversation (written by src/sessions.py):
+  #   session_id (S, hash)  - "<channel>:<sender>"
+  #   last_question / last_answer (S), awaiting_clarification (BOOL)
+  #   pending_feedback (S)  - last "that's wrong" correction for the next turn
+  #   turn_count (N), updated_at (S), conv_channel (S), last_steps (S, JSON)
+  #   expires_at (N)        - epoch seconds; DynamoDB TTL deletes after expiry
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  InboundMailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 7
+
+  InboundMailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InboundMailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${InboundMailBucket.Arn}/inbound/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/*"
+
+  # The orchestrator Lambda function
+  OrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: orchestrator.handler
+      Runtime: python3.12
+      # NOTE (issue 114): the default 3s timeout / 128 MB are too small for
+      # the chained flow (inbound event -> session load -> external Nexus
+      # engine call -> outbound reply). Set an explicit 60s timeout and a
+      # modest memory allocation. Active tracing is off on purpose: X-Ray
+      # PutTraceSegments cannot be scoped to a resource and this stack allows
+      # no wildcard IAM.
+      Timeout: 60
+      MemorySize: 512
+      # NOTE (issues 104, 110): async invocation failures (from both the SES
+      # receipt-rule action and the SNS event) are captured to the SQS DLQ
+      # above instead of being dropped after retry exhaustion, and the
+      # OrchestratorErrorsAlarm makes any such failure visible.
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt OrchestratorDLQ.Arn
+      EventInvokeConfig:
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt OrchestratorDLQ.Arn
+      Environment:
+        Variables:
+          SES_FROM: judges@cds.3dogs.ai
+          # Replies need a non-empty allowlist even though replies to the
+          # inbound sender are always permitted (see src/channels.py).
+          ALLOWED_DESTINATIONS: judges@cds.3dogs.ai
+          # Show the structured agent steps at the end of each email reply.
+          AGENT_STEPS: "1"
+          SESSIONS_TABLE: !Ref SessionsTable
+          SNS_TOPIC_ARN: !Ref InboundSmsTopic
+          SES_INBOUND_BUCKET: !Ref InboundMailBucket
+          SES_INBOUND_PREFIX: inbound/
+          # Engine endpoint configuration. The orchestrator reads
+          # NEXUS_ENDPOINT / NEXUS_TOKEN from the environment; secrets must
+          # come from the environment or a secrets source, never from
+          # repository content.
+          NEXUS_ENDPOINT: !Ref NexusEndpoint
+          NEXUS_TOKEN: !Ref NexusToken
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            # NOTE (issues 48, 105, 112, 864): least-privilege scoping --
+            # ses:SendEmail / ses:SendRawEmail are scoped to the domain identity
+            # cds.3dogs.ai; Condition StringEquals ses:FromAddress: !Ref JudgingEmail
+            # lets the function send only from judges@cds.3dogs.ai, never from any
+            # other address of the domain. PREREQUISITE (manual, out-of-repo):
+            # the domain identity cds.3dogs.ai must be verified in Amazon SES before outbound sends succeed; identity verification is external to this stack.
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource:
+                - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/cds.3dogs.ai"
+              Condition:
+                StringEquals:
+                  ses:FromAddress: !Ref JudgingEmail
+            # NOTE (issues 48, 104, 108): least-privilege scoping -- outbound
+            # SMS replies are sent via AWS End User Messaging SMS
+            # (pinpoint-sms-voice-v2) SendTextMessage from the orchestrator's
+            # v2 client; the IAM prefix for that v2 API is `sms-voice`.
+            # Resources are scoped to this account's phone pools, phone
+            # numbers, and configuration sets instead of "*".
+            # NOTE (issue 51): `sms-voice:SendTextMessage` is CORRECT for
+            # this architecture -- replies are sent with the End User
+            # Messaging SMS v2 `SendTextMessage` API (service prefix
+            # `sms-voice`), not with `sns:Publish`. SNS is used only for
+            # INBOUND event routing (topic -> Lambda trigger above); Amazon
+            # Pinpoint (v1, non-v2) APIs are end-of-support and are not used
+            # anywhere in this template.
+            - Effect: Allow
+              Action:
+                - sms-voice:SendTextMessage
+              Resource:
+                - !Sub "arn:aws:sms-voice:${AWS::Region}:${AWS::AccountId}:pool/*"
+                - !Sub "arn:aws:sms-voice:${AWS::Region}:${AWS::AccountId}:phone-number/*"
+                - !Sub "arn:aws:sms-voice:${AWS::Region}:${AWS::AccountId}:configuration-set/*"
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                # NOTE (issue 108): grant DeleteItem so the orchestrator can
+                # expire/clean up sessions without an AccessDenied failure;
+                # TTL deletion also remains as the passive backstop.
+                - dynamodb:DeleteItem
+              Resource: !GetAtt SessionsTable.Arn
+            # NOTE (issue 104): the function needs sqs:SendMessage on its DLQ
+            # to deliver failed async invocation events there.
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt OrchestratorDLQ.Arn
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource:
+                - !Sub "${InboundMailBucket.Arn}/inbound/*"
+      Events:
+        # NOTE (issues 19, 102, 103): this SAM `SNS` event is the single,
+        # explicit subscription wiring for inbound SMS. It creates BOTH the
+        # topic subscription AND the Lambda resource-policy grant (invoke
+        # permission) for the sns.amazonaws.com principal; without that grant
+        # the SNS trigger would fail with access denied, and any additional
+        # inline topic Subscription would double-invoke the function. The
+        # SES-side grant is the explicit InboundEmailPermission resource
+        # below.
+        InboundSms:
+          Type: SNS
+          Properties:
+            Topic: !Ref InboundSmsTopic
+
+  # Permission for SES to invoke the Lambda (issue 19: without this resource-
+  # policy grant for the ses.amazonaws.com principal, the receipt-rule Lambda
+  # action silently fails).
+  # NOTE (issues 49, 106): SourceArn scopes the grant to this account's SES
+  # receipt rule sets, in addition to SourceAccount, so no other account or
+  # unrelated SES resource can invoke the function. (SES receipt-rule Lambda
+  # actions cannot carry a per-rule ARN at grant time; the rule-set wildcard
+  # plus SourceAccount is the tightest scope SES supports here, and the
+  # IsJudgingEmail condition on the rule set itself keeps the only rule
+  # targeted at the judges' mailbox.)
+  InboundEmailPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OrchestratorFunction
+      Principal: ses.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/*"
+
+Outputs:
+  OrchestratorArn:
+    Description: "Orchestrator Lambda function ARN"
+    Value: !GetAtt OrchestratorFunction.Arn
+
+  SessionsTableName:
+    Description: "DynamoDB table name for session data"
+    Value: !Ref SessionsTable
+
+  InboundSmsTopicArn:
+    Description: >
+      SNS topic ARN for inbound SMS events. Owner-provisioned step (issue 10):
+      point an End User Messaging SMS configuration-set event destination at
+      this topic to enable two-way SMS.
+    Value: !Ref InboundSmsTopic
+
+  OrchestratorDLQArn:
+    Description: "Dead-letter queue ARN for failed async invocations"
+    Value: !GetAtt OrchestratorDLQ.Arn
+
+  OrchestratorErrorsAlarmName:
+    Description: >
+      CloudWatch alarm (issue 110) that fires when the orchestrator Lambda
+      reports any Errors, so failed async invocations are visible instead of
+      silently dropping inbound email/SMS.
+    Value: !Ref OrchestratorErrorsAlarm
+
+  JudgingEmailUsed:
+    Description: "Judging email address (must match test_receipt_rule.py)"
+    Value: !Ref JudgingEmail
+
+  InboundRuleSetName:
+    Description: "SES receipt rule set the deploy helper activates"
+    Condition: IsJudgingEmail
+    Value: !Ref InboundEmailRuleSet

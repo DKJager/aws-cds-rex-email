@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Rex, 3Dogs Nexus engine - one Lambda with a Function URL, DynamoDB session
+  memory and Amazon Bedrock Converse (us-east-1).
+
+Parameters:
+  EngineToken:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: Bearer token the engine requires on every request.
+  ModelId:
+    Type: String
+    Default: openai.gpt-oss-120b-1:0
+    Description: Primary Bedrock model id (Converse API).
+  ModelIdFallback:
+    Type: String
+    Default: amazon.nova-pro-v1:0
+    Description: Fallback Bedrock model id used if the primary call fails.
+
+Resources:
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: awscds-engine-sessions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      Tags:
+        - Key: project
+          Value: awscds
+
+  # Explicit role so its name is under the awscds-* prefix the deployer is
+  # allowed to create. Grants the equivalent of SAM's DynamoDBCrudPolicy on the
+  # sessions table plus Bedrock invoke on the two configured models, plus basic
+  # CloudWatch logs.
+  EngineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: awscds-engine-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: awscds-engine-dynamodb-crud
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource:
+                  - !GetAtt SessionsTable.Arn
+        - PolicyName: awscds-engine-bedrock-invoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/openai.gpt-oss-120b-1:0"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-pro-v1:0"
+      Tags:
+        - Key: project
+          Value: awscds
+
+  EngineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: awscds-engine
+      Description: Rex, 3Dogs Nexus business Q&A engine
+      CodeUri: .
+      Handler: app.handler
+      Runtime: python3.12
+      Architectures:
+        - x86_64
+      Timeout: 40
+      MemorySize: 512
+      Role: !GetAtt EngineRole.Arn
+      FunctionUrlConfig:
+        AuthType: NONE
+      Environment:
+        Variables:
+          ENGINE_TOKEN: !Ref EngineToken
+          MODEL_ID: !Ref ModelId
+          MODEL_ID_FALLBACK: !Ref ModelIdFallback
+          SESSIONS_TABLE: !Ref SessionsTable
+      Tags:
+        project: awscds
+
+Outputs:
+  EngineUrl:
+    Description: Function URL of the engine (POST JSON with Authorization Bearer token)
+    Value: !GetAtt EngineFunctionUrl.FunctionUrl
+  SessionsTableName:
+    Description: DynamoDB table holding per-session conversation turns
+    Value: !Ref SessionsTable

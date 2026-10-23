@@ -1,0 +1,100 @@
+# Environment files
+.env
+.env.local
+.env.*
+
+# Credential-like artifacts (never copied into images; secrets come from environment variables)
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+id_rsa*
+*.keystore
+*.jks
+secrets/
+secrets/**
+.secret
+*.secret
+
+# VCS
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# JavaScript / Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test output and coverage
+coverage/
+.nyc_output/
+junit*.xml
+test-results/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Caches and coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ML engine weights and model artifacts (never embedded; engines are external services)
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.h5
+*.tflite
+*.gguf
+*.ggml
+models/
+model/
+weights/
+checkpoints/
+
+# Logs and secret-adjacent files
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
